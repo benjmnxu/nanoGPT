@@ -3,6 +3,8 @@
 #include <stdexcept>
 #include <vector>
 #include <csignal>
+#include <fstream>  // For file I/O
+#include <chrono>   // For timestamps
 
 // For system calls and timing
 #include <unistd.h>
@@ -99,20 +101,27 @@ int main(int argc, char* argv[]) {
     int gpu_id = std::stoi(argv[2]);
 
     // --- NEW Sliding Window Configuration ---
-    // Total number of historical measurements to keep.
-    const size_t WINDOW_SIZE_N = 20; // e.g., 20 measurements * 50ms = 1 second of history
-
-    // Activate if the sum of power in the newest 10 readings is less than the
-    // sum of the oldest 10 readings by this amount. This detects a rapid drop.
-    const int POWER_DROP_THRESHOLD_WATTS = 500; // A 500W aggregate drop
-
-    const unsigned int POLLING_INTERVAL_US = 50000; // 50ms polling
+    const size_t WINDOW_SIZE_N = 20;
+    const int POWER_DROP_THRESHOLD_WATTS = 500;
+    const unsigned int POLLING_INTERVAL_US = 50000;
 
     // --- Setup ---
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
     SlidingWindow power_window(WINDOW_SIZE_N);
+
+    // --- NEW: Setup CSV Logging ---
+    std::ofstream log_file;
+    std::string log_filename = "power_log_gpu_" + std::to_string(gpu_id) + ".csv";
+    log_file.open(log_filename);
+    if (!log_file.is_open()) {
+        std::cerr << "Error: Could not open log file " << log_filename << std::endl;
+        return 1;
+    }
+    // Write the header row for the CSV file.
+    log_file << "timestamp_ms,prev_sum_watts,current_sum_watts\n";
+
 
     // --- Setup Shared Memory ---
     key_t key = ftok("firefly_ipc_key", gpu_id);
@@ -141,20 +150,21 @@ int main(int argc, char* argv[]) {
             unsigned int power_watts = power_milliwatts / 1000;
             power_window.add(power_watts);
 
-            // Only make a decision after the window is full of data.
             if (power_window.is_full()) {
                 long long prev_sum = power_window.get_prev_sum();
                 long long current_sum = power_window.get_current_sum();
                 
-                // A large negative difference indicates a rapid power drop.
-                // The threshold is negative because we're checking for a drop.
+                // --- NEW: Log the data to the CSV file ---
+                auto now = std::chrono::system_clock::now();
+                auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                log_file << ms_since_epoch << "," << prev_sum << "," << current_sum << "\n";
+
                 if ((current_sum - prev_sum) < -POWER_DROP_THRESHOLD_WATTS) {
                     *shared_flag = 1; // Signal RUN
                 } else {
                     *shared_flag = 0; // Signal STOP
                 }
             } else {
-                // Before window is full, remain in STOP state for safety.
                 *shared_flag = 0;
             }
         } else {
